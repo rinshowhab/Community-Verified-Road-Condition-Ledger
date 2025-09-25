@@ -16,6 +16,8 @@
 (define-constant REWARD-AMOUNT u500000)
 (define-constant VERIFICATION-THRESHOLD u3)
 (define-constant REPORT-EXPIRY-BLOCKS u144)
+(define-constant QUALITY-DECAY-RATE u5)
+(define-constant MAX-QUALITY-SCORE u1000)
 
 (define-data-var next-report-id uint u1)
 (define-data-var total-verified-reports uint u0)
@@ -56,6 +58,17 @@
 (define-map location-reports
     { latitude: int, longitude: int }
     { latest-report-id: uint, report-count: uint }
+)
+
+(define-map road-quality-index
+    { latitude: int, longitude: int }
+    {
+        quality-score: uint,
+        confidence-level: uint,
+        last-updated: uint,
+        trend-direction: (string-ascii 10),
+        historical-average: uint
+    }
 )
 
 (define-public (submit-report (lat int) (lng int) (condition (string-ascii 20)) (severity uint) (desc (string-utf8 256)))
@@ -147,6 +160,7 @@
         (if is-verified
             (begin
                 (var-set total-verified-reports (+ (var-get total-verified-reports) u1))
+                (try! (update-quality-index report-id))
                 (distribute-rewards report-id)
             )
             (begin
@@ -279,5 +293,69 @@
     (begin
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
         (ok true)
+    )
+)
+
+(define-private (update-quality-index (report-id uint))
+    (let (
+        (report (unwrap! (map-get? road-reports { report-id: report-id }) ERR-REPORT-NOT-FOUND))
+        (location-key { latitude: (get latitude report), longitude: (get longitude report) })
+        (current-index (default-to 
+            { quality-score: (/ MAX-QUALITY-SCORE u2), confidence-level: u0, last-updated: u0, trend-direction: "stable", historical-average: u0 }
+            (map-get? road-quality-index location-key)))
+        (time-decay (- stacks-block-height (get last-updated current-index)))
+        (decayed-score (if (> time-decay u0)
+            (if (> (get quality-score current-index) (* time-decay QUALITY-DECAY-RATE))
+                (- (get quality-score current-index) (* time-decay QUALITY-DECAY-RATE))
+                u0)
+            (get quality-score current-index)))
+        (report-impact (- MAX-QUALITY-SCORE (* (get severity report) u100)))
+        (confidence-weight (+ u10 (get verification-count report)))
+        (new-score (/ (+ (* decayed-score (get confidence-level current-index)) (* report-impact confidence-weight))
+                      (+ (get confidence-level current-index) confidence-weight)))
+        (new-confidence (+ (get confidence-level current-index) confidence-weight))
+    )
+        (map-set road-quality-index location-key
+            {
+                quality-score: new-score,
+                confidence-level: new-confidence,
+                last-updated: stacks-block-height,
+                trend-direction: (if (> new-score (get quality-score current-index)) "improving" "declining"),
+                historical-average: (/ (+ (* (get historical-average current-index) (get confidence-level current-index)) new-score)
+                                       (+ (get confidence-level current-index) u1))
+            })
+        (ok true)
+    )
+)
+
+(define-read-only (get-road-quality (lat int) (lng int))
+    (match (map-get? road-quality-index { latitude: lat, longitude: lng })
+        index
+        (let (
+            (time-decay (- stacks-block-height (get last-updated index)))
+            (decayed-score (if (> time-decay u0)
+                (if (> (get quality-score index) (* time-decay QUALITY-DECAY-RATE))
+                    (- (get quality-score index) (* time-decay QUALITY-DECAY-RATE))
+                    u0)
+                (get quality-score index)))
+        )
+            (ok { quality-score: decayed-score, confidence: (get confidence-level index), trend: (get trend-direction index) }))
+        (err ERR-REPORT-NOT-FOUND)
+    )
+)
+
+(define-read-only (compare-route-quality (lat1 int) (lng1 int) (lat2 int) (lng2 int))
+    (let (
+        (location1-data (unwrap! (get-road-quality lat1 lng1) (ok { better-route: "unknown", quality-difference: u0 })))
+        (location2-data (unwrap! (get-road-quality lat2 lng2) (ok { better-route: "unknown", quality-difference: u0 })))
+        (location1-quality (get quality-score location1-data))
+        (location2-quality (get quality-score location2-data))
+    )
+        (ok {
+            better-route: (if (> location1-quality location2-quality) "route1" "route2"),
+            quality-difference: (if (> location1-quality location2-quality) 
+                                   (- location1-quality location2-quality) 
+                                   (- location2-quality location1-quality))
+        })
     )
 )
