@@ -11,6 +11,8 @@
 (define-constant ERR-INVALID-CONDITION (err u104))
 (define-constant ERR-REPORT-EXPIRED (err u105))
 (define-constant ERR-ALREADY-VERIFIED (err u106))
+(define-constant ERR-INVALID-ROUTE (err u107))
+(define-constant ERR-ROUTE-TOO-LONG (err u108))
 
 (define-constant MIN-STAKE u1000000)
 (define-constant REWARD-AMOUNT u500000)
@@ -356,6 +358,148 @@
             quality-difference: (if (> location1-quality location2-quality) 
                                    (- location1-quality location2-quality) 
                                    (- location2-quality location1-quality))
+        })
+    )
+)
+
+(define-map route-analyses
+    { route-hash: (buff 32) }
+    {
+        waypoint-count: uint,
+        average-quality: uint,
+        minimum-quality: uint,
+        overall-confidence: uint,
+        hazard-count: uint,
+        analysis-timestamp: uint,
+        requester: principal
+    }
+)
+
+(define-data-var route-analysis-count uint u0)
+
+(define-private (calculate-point-quality (waypoint {lat: int, lng: int}) (accumulator {total: uint, count: uint, min: uint, hazards: uint, confidence: uint}))
+    (let (
+        (quality-result (get-road-quality (get lat waypoint) (get lng waypoint)))
+    )
+        (match quality-result
+            ok-data
+            (let (
+                (quality (get quality-score ok-data))
+                (conf (get confidence ok-data))
+                (current-min (get min accumulator))
+                (is-hazard (< quality u300))
+            )
+                {
+                    total: (+ (get total accumulator) quality),
+                    count: (+ (get count accumulator) u1),
+                    min: (if (or (is-eq current-min u0) (< quality current-min)) quality current-min),
+                    hazards: (+ (get hazards accumulator) (if is-hazard u1 u0)),
+                    confidence: (+ (get confidence accumulator) conf)
+                }
+            )
+            err-val accumulator
+        )
+    )
+)
+
+(define-read-only (analyze-route (waypoints (list 20 {lat: int, lng: int})))
+    (let (
+        (waypoint-count (len waypoints))
+        (analysis-result (fold calculate-point-quality waypoints {total: u0, count: u0, min: u0, hazards: u0, confidence: u0}))
+        (total-quality (get total analysis-result))
+        (point-count (get count analysis-result))
+        (min-quality (get min analysis-result))
+        (hazard-count (get hazards analysis-result))
+        (total-confidence (get confidence analysis-result))
+    )
+        (asserts! (> waypoint-count u0) ERR-INVALID-ROUTE)
+        (asserts! (<= waypoint-count u20) ERR-ROUTE-TOO-LONG)
+        
+        (if (is-eq point-count u0)
+            (ok {
+                average-quality: u0,
+                minimum-quality: u0,
+                overall-confidence: u0,
+                hazard-count: u0,
+                waypoint-count: waypoint-count,
+                points-analyzed: u0,
+                route-rating: "unknown",
+                recommendation: "no-data"
+            })
+            (let (
+                (avg-quality (/ total-quality point-count))
+                (avg-confidence (/ total-confidence point-count))
+                (route-rating (if (>= avg-quality u700) "excellent"
+                              (if (>= avg-quality u500) "good"
+                              (if (>= avg-quality u300) "fair"
+                              "poor"))))
+                (recommendation (if (> hazard-count u2) "avoid"
+                                (if (< min-quality u200) "caution"
+                                (if (>= avg-quality u600) "recommended"
+                                "acceptable"))))
+            )
+                (ok {
+                    average-quality: avg-quality,
+                    minimum-quality: min-quality,
+                    overall-confidence: avg-confidence,
+                    hazard-count: hazard-count,
+                    waypoint-count: waypoint-count,
+                    points-analyzed: point-count,
+                    route-rating: route-rating,
+                    recommendation: recommendation
+                })
+            )
+        )
+    )
+)
+
+(define-public (save-route-analysis (waypoints (list 20 {lat: int, lng: int})) (route-hash (buff 32)))
+    (let (
+        (analysis (unwrap! (analyze-route waypoints) ERR-INVALID-ROUTE))
+    )
+        (map-set route-analyses
+            { route-hash: route-hash }
+            {
+                waypoint-count: (get waypoint-count analysis),
+                average-quality: (get average-quality analysis),
+                minimum-quality: (get minimum-quality analysis),
+                overall-confidence: (get overall-confidence analysis),
+                hazard-count: (get hazard-count analysis),
+                analysis-timestamp: stacks-block-height,
+                requester: tx-sender
+            }
+        )
+        (var-set route-analysis-count (+ (var-get route-analysis-count) u1))
+        (ok true)
+    )
+)
+
+(define-read-only (get-saved-route-analysis (route-hash (buff 32)))
+    (map-get? route-analyses { route-hash: route-hash })
+)
+
+(define-read-only (get-total-route-analyses)
+    (var-get route-analysis-count)
+)
+
+(define-read-only (compare-routes (route1 (list 20 {lat: int, lng: int})) (route2 (list 20 {lat: int, lng: int})))
+    (let (
+        (analysis1 (unwrap! (analyze-route route1) ERR-INVALID-ROUTE))
+        (analysis2 (unwrap! (analyze-route route2) ERR-INVALID-ROUTE))
+        (route1-score (get average-quality analysis1))
+        (route2-score (get average-quality analysis2))
+        (route1-hazards (get hazard-count analysis1))
+        (route2-hazards (get hazard-count analysis2))
+    )
+        (ok {
+            better-route: (if (and (> route1-score route2-score) (<= route1-hazards route2-hazards)) "route1" "route2"),
+            route1-analysis: analysis1,
+            route2-analysis: analysis2,
+            quality-difference: (if (> route1-score route2-score) 
+                                   (- route1-score route2-score)
+                                   (- route2-score route1-score)),
+            safety-comparison: (if (< route1-hazards route2-hazards) "route1-safer" 
+                              (if (< route2-hazards route1-hazards) "route2-safer" "equal-safety"))
         })
     )
 )
