@@ -13,6 +13,10 @@
 (define-constant ERR-ALREADY-VERIFIED (err u106))
 (define-constant ERR-INVALID-ROUTE (err u107))
 (define-constant ERR-ROUTE-TOO-LONG (err u108))
+(define-constant ERR-BOUNTY-NOT-FOUND (err u109))
+(define-constant ERR-BOUNTY-ALREADY-FULFILLED (err u110))
+(define-constant ERR-BOUNTY-EXPIRED (err u111))
+(define-constant ERR-INVALID-BOUNTY (err u112))
 
 (define-constant MIN-STAKE u1000000)
 (define-constant REWARD-AMOUNT u500000)
@@ -20,9 +24,11 @@
 (define-constant REPORT-EXPIRY-BLOCKS u144)
 (define-constant QUALITY-DECAY-RATE u5)
 (define-constant MAX-QUALITY-SCORE u1000)
+(define-constant BOUNTY-EXPIRY-BLOCKS u1008)
 
 (define-data-var next-report-id uint u1)
 (define-data-var total-verified-reports uint u0)
+(define-data-var next-bounty-id uint u1)
 
 (define-map road-reports
     { report-id: uint }
@@ -359,6 +365,128 @@
                                    (- location1-quality location2-quality) 
                                    (- location2-quality location1-quality))
         })
+    )
+)
+
+(define-map bounties
+    { bounty-id: uint }
+    {
+        creator: principal,
+        latitude: int,
+        longitude: int,
+        reward: uint,
+        description: (string-utf8 256),
+        created-at: uint,
+        fulfilled: bool,
+        fulfiller: (optional principal),
+        fulfilled-report-id: (optional uint)
+    }
+)
+
+(define-map location-bounties
+    { latitude: int, longitude: int }
+    { active-bounty-id: uint }
+)
+
+(define-public (create-bounty (lat int) (lng int) (reward uint) (desc (string-utf8 256)))
+    (let (
+        (bounty-id (var-get next-bounty-id))
+    )
+        (asserts! (>= reward MIN-STAKE) ERR-INVALID-BOUNTY)
+        (asserts! (>= (stx-get-balance tx-sender) reward) ERR-INSUFFICIENT-STAKE)
+
+        (try! (stx-transfer? reward tx-sender (as-contract tx-sender)))
+
+        (map-set bounties
+            { bounty-id: bounty-id }
+            {
+                creator: tx-sender,
+                latitude: lat,
+                longitude: lng,
+                reward: reward,
+                description: desc,
+                created-at: stacks-block-height,
+                fulfilled: false,
+                fulfiller: none,
+                fulfilled-report-id: none
+            }
+        )
+
+        (map-set location-bounties
+            { latitude: lat, longitude: lng }
+            { active-bounty-id: bounty-id }
+        )
+
+        (var-set next-bounty-id (+ bounty-id u1))
+        (ok bounty-id)
+    )
+)
+
+(define-public (fulfill-bounty (bounty-id uint) (report-id uint))
+    (let (
+        (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR-BOUNTY-NOT-FOUND))
+        (report (unwrap! (map-get? road-reports { report-id: report-id }) ERR-REPORT-NOT-FOUND))
+        (bounty-age (- stacks-block-height (get created-at bounty)))
+        (fulfiller tx-sender)
+    )
+        (asserts! (not (get fulfilled bounty)) ERR-BOUNTY-ALREADY-FULFILLED)
+        (asserts! (<= bounty-age BOUNTY-EXPIRY-BLOCKS) ERR-BOUNTY-EXPIRED)
+        (asserts! (get verified report) ERR-REPORT-NOT-FOUND)
+        (asserts! (is-eq (get latitude report) (get latitude bounty)) ERR-INVALID-BOUNTY)
+        (asserts! (is-eq (get longitude report) (get longitude bounty)) ERR-INVALID-BOUNTY)
+        (asserts! (is-eq (get reporter report) tx-sender) ERR-NOT-AUTHORIZED)
+
+        (try! (as-contract (stx-transfer? (get reward bounty) tx-sender fulfiller)))
+
+        (map-set bounties
+            { bounty-id: bounty-id }
+            (merge bounty {
+                fulfilled: true,
+                fulfiller: (some fulfiller),
+                fulfilled-report-id: (some report-id)
+            })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (cancel-bounty (bounty-id uint))
+    (let (
+        (bounty (unwrap! (map-get? bounties { bounty-id: bounty-id }) ERR-BOUNTY-NOT-FOUND))
+        (bounty-age (- stacks-block-height (get created-at bounty)))
+        (creator tx-sender)
+    )
+        (asserts! (is-eq (get creator bounty) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (not (get fulfilled bounty)) ERR-BOUNTY-ALREADY-FULFILLED)
+        (asserts! (> bounty-age BOUNTY-EXPIRY-BLOCKS) ERR-BOUNTY-EXPIRED)
+
+        (try! (as-contract (stx-transfer? (get reward bounty) tx-sender creator)))
+
+        (map-set bounties
+            { bounty-id: bounty-id }
+            (merge bounty { fulfilled: true })
+        )
+
+        (ok true)
+    )
+)
+
+(define-read-only (get-bounty (bounty-id uint))
+    (map-get? bounties { bounty-id: bounty-id })
+)
+
+(define-read-only (get-location-bounty (lat int) (lng int))
+    (map-get? location-bounties { latitude: lat, longitude: lng })
+)
+
+(define-read-only (is-bounty-expired (bounty-id uint))
+    (match (map-get? bounties { bounty-id: bounty-id })
+        bounty
+        (let ((bounty-age (- stacks-block-height (get created-at bounty))))
+            (> bounty-age BOUNTY-EXPIRY-BLOCKS)
+        )
+        true
     )
 )
 
